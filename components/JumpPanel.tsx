@@ -97,7 +97,7 @@ function DiagnosticsView({ result, stats }: { result: ExtractionResult | null, s
     </div>
   )
 
-  const { messages, strategy, quality } = result
+  const { messages, strategy } = result
   const cats = stats ? Object.entries(stats.classifiedByCategory as Record<string, number>) : []
 
   return (
@@ -109,7 +109,7 @@ function DiagnosticsView({ result, stats }: { result: ExtractionResult | null, s
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
           {[
             ["Strategy", strategy], ["Extracted", `${messages.length} msgs`],
-            ["Score", `${quality.score}/100`], ["Time", stats ? `${stats.processingTimeMs}ms` : "-"],
+            ["Warnings", `${result.warnings.length}`], ["Time", stats ? `${stats.processingTimeMs}ms` : "-"],
             ["Discarded", stats ? `${stats.discardedNoise} noise` : "-"], ["Reduction", stats ? stats.compressionRatio : "-"],
           ].map(([l, v]) => (
             <div key={l} style={{ padding: "6px 8px", borderRadius: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
@@ -137,21 +137,17 @@ function DiagnosticsView({ result, stats }: { result: ExtractionResult | null, s
 
       {/* Raw Messages List */}
       <div style={{ padding: "10px 0" }}>
-        <div style={{ padding: "0 14px", fontSize: 9.5, fontWeight: 700, color: "rgba(255,255,255,0.25)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Raw Message Context</div>
-        {messages.map((msg) => (
-          <div key={msg.id} style={{
-            padding: "6px 14px", borderBottom: "1px solid rgba(255,255,255,0.03)",
-            background: msg.role === "user" ? "rgba(96,165,250,0.03)" : "transparent"
+        <div style={{ padding: "0 14px", fontSize: 9.5, fontWeight: 700, color: "rgba(255,255,255,0.25)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Raw Extraction Dump</div>
+        <div style={{ padding: "0 14px" }}>
+          <pre style={{
+            margin: 0, padding: "10px", background: "rgba(0,0,0,0.3)", borderRadius: 6,
+            fontSize: 10, color: "rgba(255,255,255,0.6)", whiteSpace: "pre-wrap",
+            border: "1px solid rgba(255,255,255,0.05)", fontFamily: "monospace",
+            lineHeight: 1.5
           }}>
-            <div style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 3, color: msg.role === "user" ? "#60a5fa" : "#cc785c" }}>
-              [{msg.role.toUpperCase()}] <span style={{ opacity: 0.5 }}>· {msg.content.length}c</span>
-              {msg.codeBlocks.length > 0 && <span style={{ color: "#94a3b8", marginLeft: 6 }}>+{msg.codeBlocks.length} code</span>}
-            </div>
-            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.45)", lineHeight: 1.4, whiteSpace: "pre-wrap" as const, maxHeight: 60, overflow: "hidden" }}>
-              {msg.content.slice(0, 150)}{msg.content.length > 150 ? "…" : ""}
-            </div>
-          </div>
-        ))}
+            {result.debugDump}
+          </pre>
+        </div>
       </div>
 
     </div>
@@ -207,7 +203,9 @@ export function JumpPanel() {
         setPacket(built)
         setDebugStats(stats)
 
-        if (!result.quality.isReliable) {
+        const isReliable = !result.warnings.some(w => w.includes("incomplete") || w.includes("0 messages"))
+
+        if (!isReliable) {
           setPanelState("warning")
           setStatusMsg("Low confidence extraction detected. Continuation may be incomplete.")
           return // Stop here, wait for user to click "Continue Anyway"
@@ -224,27 +222,31 @@ export function JumpPanel() {
       }
     }
 
-    // -- Jumping logic (reached if reliable OR if forceContinue is true) --
-    if (platform && packet) {
-      const text = formatPacketForPlatform(packet, platform.id)
-      await navigator.clipboard.writeText(text)
-      setPanelState("copied")
-      setStatusMsg(`✓ Ready to continue (~${packet.tokenEstimate} tokens)`)
+      // -- Jumping logic (reached if reliable OR if forceContinue is true) --
+      if (platform && packet) {
+        const text = formatPacketForPlatform(packet, platform.id)
+        await navigator.clipboard.writeText(text)
+        setPanelState("copied")
+        setStatusMsg(`✓ Ready to continue (~${packet.tokenEstimate} tokens)`)
 
-      await new Promise(r => setTimeout(r, 700))
-      chrome.runtime.sendMessage({ type: "OPEN_TAB", url: platform.url })
+        await new Promise(r => setTimeout(r, 700))
+        chrome.runtime.sendMessage({ 
+          type: "OPEN_TAB", 
+          url: platform.url,
+          packetText: text
+        })
 
-      setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 2500)
-    } else if (!platform && !forceContinue) {
-      setPanelState("idle")
-      setStatusMsg("")
-      setTab("preview")
-    } else if (forceContinue && !platform) {
-      // forced preview
-      setPanelState("idle")
-      setStatusMsg("")
-      setTab("preview")
-    }
+        setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 2500)
+      } else if (!platform && !forceContinue) {
+        setPanelState("idle")
+        setStatusMsg("")
+        setTab("preview")
+      } else if (forceContinue && !platform) {
+        // forced preview
+        setPanelState("idle")
+        setStatusMsg("")
+        setTab("preview")
+      }
   }, [mode, packet])
 
   useEffect(() => {

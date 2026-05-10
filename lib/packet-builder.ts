@@ -2,6 +2,8 @@ import type { ContinuationPacket, ContinuationScore, ClassifiedMessage, Compress
 import { classifyMessages } from "./classifiers"
 import { compressMessages, estimateTokens } from "./compression"
 import type { ExtractedMessage } from "./extractor"
+import { toExtractedMessages } from "./extractor"
+import type { RawMessage } from "./extractor"
 
 // ─── Pattern Libraries ────────────────────────────────────────────────────────
 
@@ -314,15 +316,18 @@ function scoreContinuation(
 // ─── Smart Packet Builder ─────────────────────────────────────────────────────
 
 export function buildContinuationPacket(
-  rawMessages: ExtractedMessage[],
+  rawMessages: RawMessage[],
   mode: CompressionMode = "balanced"
-): { packet: ContinuationPacket; debugStats: ReturnType<typeof buildDebugStats> } {
+): { packet: ContinuationPacket; debugStats: any } {
   const t0 = performance.now()
 
-  // 1. Classify
-  const classified = classifyMessages(rawMessages)
+  // 1. Convert to legacy ExtractedMessage shape
+  const messages = toExtractedMessages(rawMessages)
 
-  // 2. Compress
+  // 2. Classify
+  const classified = classifyMessages(messages)
+
+  // 3. Compress
   const { kept, discarded, tokenEstimate, compressionRatio } = compressMessages(classified, mode)
 
   // 3. Build packet sections from kept messages

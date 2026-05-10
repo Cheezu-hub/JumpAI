@@ -1,46 +1,26 @@
 /**
- * JumpAI V2 — Robust Claude Conversation Extractor
+ * JumpAI V2 — Claude Conversation Extractor
  *
- * Strategy:
- * 1. Locate the conversation scroll container (NOT the sidebar or nav)
- * 2. Find message turn containers using multiple selector strategies
- * 3. Determine role from DOM signals (data attrs, class names, position)
- * 4. Extract clean text + code blocks from each message
- * 5. Aggressively filter UI noise
- * 6. Validate extraction quality
+ * Goal: reconstruct the FULL Claude chat thread as an ordered array of
+ *   { role: "user" | "assistant", content: string }
+ *
+ * Strategy (cascading):
+ *  1. data-testid selectors  — most reliable, Claude uses them
+ *  2. data-role attributes   — some Claude builds expose this
+ *  3. Scroll-container walk  — infers role from DOM position / class signals
+ *
+ * Progressive scrolling recovers lazily-rendered (virtualised) history.
  */
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Public Types ─────────────────────────────────────────────────────────────
 
-export interface ExtractedMessage {
-  id: string
+export interface RawMessage {
   role: "user" | "assistant"
-  content: string          // Clean prose text (no code blocks)
-  codeBlocks: CodeBlock[]
-  rawLength: number        // Original character count before cleaning
-  index: number
-}
-
-export interface CodeBlock {
-  language: string
-  code: string
-  filename?: string
-}
-
-export interface ExtractionResult {
-  messages: ExtractedMessage[]
-  strategy: string          // Which strategy worked
-  quality: ExtractionQuality
-  warnings: string[]
-}
-
-export interface ExtractionQuality {
-  score: number             // 0–100
-  isReliable: boolean
-  issues: string[]
+  content: string            // clean prose + code blocks joined as markdown
 }
 
 export interface ExtractionProgress {
+  stage: string
   totalFound: number
   userCount: number
   assistantCount: number
@@ -48,537 +28,254 @@ export interface ExtractionProgress {
   durationMs: number
 }
 
-// ─── UI Noise Vocabulary ──────────────────────────────────────────────────────
-// These are exact strings / fragments that indicate Claude UI chrome, not conversation.
+export interface ExtractionResult {
+  messages: RawMessage[]
+  strategy: string
+  warnings: string[]
+  /** Raw debug string — human-readable dump of what was found */
+  debugDump: string
+}
 
-const UI_NOISE_EXACT = new Set([
-  "free plan", "pro plan", "team plan", "enterprise",
-  "upgrade", "upgrade to pro", "upgrade plan",
+// ─── Noise Gate ───────────────────────────────────────────────────────────────
+// Short-circuit phrases that are NEVER real conversation content.
+
+const NOISE_PHRASES = new Set([
+  "free plan", "pro plan", "team plan", "enterprise plan",
+  "upgrade", "upgrade to pro", "upgrade plan", "upgrade now",
   "new chat", "new conversation",
   "recent conversations", "starred conversations",
   "search conversations", "search chats",
-  "claude.ai", "anthropic",
   "settings", "sign out", "sign in", "log in", "log out",
   "help", "help center", "documentation",
   "keyboard shortcuts", "shortcuts",
   "projects", "recents", "starred",
-  "send", "attach", "attach file", "upload",
-  "copy", "edit", "retry", "regenerate",
+  "copy", "edit", "retry", "regenerate", "stop generating",
   "like", "dislike", "thumbs up", "thumbs down",
   "share", "export",
-  "reply", "continue", "cancel", "stop generating",
-  "claude", // standalone "claude" label in header
-  "claude 3", "claude 3.5", "claude opus", "claude sonnet", "claude haiku",
   "model:", "switch model",
-  "chat", "chats",
-  "back", "close",
+  "back", "close", "cancel",
+  "send message", "message claude",
+  "claude.ai", "anthropic",
 ])
 
-const UI_NOISE_PREFIXES = [
-  "press ",
-  "use ",
-  "click ",
-  "type ",
-  "ctrl+",
-  "cmd+",
-  "alt+",
-  "shift+",
-  "⌘",
-  "⌥",
-  "↩",
-  "you're on the",
-  "you are on the",
-  "started on",
-  "today,",
-  "yesterday,",
-  "last week",
-  "view all",
-  "see all",
-  "load more",
-  "showing ",
-  "page ",
-]
-
-const UI_NOISE_PATTERNS = [
-  /^\d+\s*\/\s*\d+$/,              // "3 / 10" pagination
-  /^[\d,]+ tokens?$/i,             // "1,234 tokens"
-  /^message \d+ of \d+$/i,         // "Message 1 of 5"
-  /^\d+:\d+\s*(am|pm)?$/i,         // Timestamps like "3:45 PM"
-  /^today$|^yesterday$/i,
+const NOISE_PATTERNS = [
+  /^[\d,]+\s*tokens?$/i,
+  /^\d+:\d+\s*(am|pm)?$/i,
   /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i,
-  /^[a-z]\s*[-–]\s*[a-z]/i,       // Single letter navigation labels
+  /^\d+\s*\/\s*\d+$/,
+  /^today$|^yesterday$/i,
+  /^\$\d+\s*\/\s*(month|mo|yr|year)/i,
 ]
 
-/**
- * Returns true if text is likely UI chrome, not conversation content.
- */
-export function isLikelyNoise(text: string): boolean {
-  const trimmed = text.trim()
-  const lower = trimmed.toLowerCase()
-
-  // Empty or extremely short
-  if (trimmed.length < 3) return true
-
-  // Very short with no meaningful content (< 25 chars, not a code line)
-  if (trimmed.length < 25 && !trimmed.includes("\n") && !/[{};()=]/.test(trimmed)) {
-    // Allow short tech terms, error codes, filenames
-    if (!/\.(tsx?|jsx?|py|go|rs|md|json|yaml|css|html|sh)$/.test(lower) &&
-        !/^[A-Z_]{2,}$/.test(trimmed) && // Constants like ENV_VAR
-        !/error|warning|failed|success/i.test(trimmed)) {
-      // Check if it's a UI phrase
-      if (UI_NOISE_EXACT.has(lower)) return true
-      if (UI_NOISE_PATTERNS.some(p => p.test(trimmed))) return true
-      // If it's very short and not code-like, likely UI
-      if (trimmed.length < 15) return true
-    }
-  }
-
-  // Exact UI phrase match
-  if (UI_NOISE_EXACT.has(lower)) return true
-
-  // Prefix match
-  if (UI_NOISE_PREFIXES.some(p => lower.startsWith(p))) return true
-
-  // Pattern match
-  if (UI_NOISE_PATTERNS.some(p => p.test(trimmed))) return true
-
-  // Detect pricing UI: "Free Plan", "Pro $X/month", etc.
-  if (/(?:free|pro|team|enterprise)\s+(?:plan|tier)/i.test(trimmed)) return true
-  if (/\$\d+\s*\/\s*(?:month|mo|yr|year)/i.test(trimmed)) return true
-
-  // Navigation-like: all caps short phrase (UI buttons)
-  if (/^[A-Z\s]{3,20}$/.test(trimmed) && trimmed.split(" ").length <= 3) return true
-
+function isNoise(text: string): boolean {
+  const t = text.trim()
+  if (t.length < 3) return true
+  const lo = t.toLowerCase()
+  if (NOISE_PHRASES.has(lo)) return true
+  if (NOISE_PATTERNS.some(r => r.test(t))) return true
+  // All-uppercase short phrase = UI button label
+  if (/^[A-Z\s]{3,20}$/.test(t) && t.split(" ").length <= 3) return true
   return false
 }
 
-// ─── DOM Utilities ────────────────────────────────────────────────────────────
+// ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Returns true if an element is visually hidden or not in the conversation area.
- */
-function isHiddenElement(el: Element): boolean {
-  const style = window.getComputedStyle(el)
+function isHidden(el: Element): boolean {
+  const s = window.getComputedStyle(el)
   return (
-    style.display === "none" ||
-    style.visibility === "hidden" ||
-    style.opacity === "0" ||
+    s.display === "none" ||
+    s.visibility === "hidden" ||
+    s.opacity === "0" ||
     el.getAttribute("aria-hidden") === "true" ||
     (el as HTMLElement).hidden
   )
 }
 
-/**
- * Returns true if element is inside the sidebar or navigation areas.
- */
-function isInSidebarOrNav(el: Element): boolean {
-  let current: Element | null = el
-  while (current && current !== document.body) {
-    const tag = current.tagName.toLowerCase()
-    const role = current.getAttribute("role") || ""
-    const cls = current.className || ""
-    const id = current.id || ""
-
+function isInSidebar(el: Element): boolean {
+  let cur: Element | null = el
+  while (cur && cur !== document.body) {
+    const tag = cur.tagName.toLowerCase()
+    const cls = (typeof cur.className === "string" ? cur.className : "").toLowerCase()
+    const role = (cur.getAttribute("role") || "").toLowerCase()
     if (tag === "nav" || tag === "aside") return true
     if (role === "navigation" || role === "complementary") return true
-
-    // Common Claude sidebar class fragments
-    if (typeof cls === "string" && (
-      /sidebar|side-bar|nav-panel|left-panel|drawer|conversation-list|chat-list/i.test(cls) ||
-      /sidebar|side-bar|nav-panel|left-panel|drawer|conversation-list|chat-list/i.test(id)
-    )) return true
-
-    current = current.parentElement
+    if (/sidebar|side-bar|nav-panel|left-panel|drawer|conversation-list/i.test(cls)) return true
+    cur = cur.parentElement
   }
   return false
 }
 
-/**
- * Extract clean text from an element, excluding code blocks (handled separately).
- */
-function extractProseText(el: Element): string {
-  // Clone so we can modify without affecting the page
+/** Extract readable text from a message element. Code blocks → fenced markdown. */
+function extractContent(el: Element): string {
   const clone = el.cloneNode(true) as Element
 
-  // Remove code blocks from prose extraction
-  clone.querySelectorAll("pre, code").forEach(c => c.remove())
+  // Remove buttons, copy icons, hidden elements
+  clone.querySelectorAll("button, [role='button'], [aria-hidden='true'], [hidden], svg").forEach(c => c.remove())
 
-  // Remove hidden elements
-  clone.querySelectorAll("[aria-hidden='true'], [hidden]").forEach(c => c.remove())
-
-  // Remove button-like elements
-  clone.querySelectorAll("button, [role='button']").forEach(c => c.remove())
-
-  const raw = (clone as HTMLElement).innerText || clone.textContent || ""
-  return cleanText(raw)
-}
-
-/**
- * Extract code blocks from a message element.
- */
-function extractCodeBlocks(el: Element): CodeBlock[] {
-  const blocks: CodeBlock[] = []
-  const pres = el.querySelectorAll("pre")
-
-  pres.forEach(pre => {
+  // Convert <pre> blocks to fenced markdown before stripping HTML
+  clone.querySelectorAll("pre").forEach(pre => {
     const codeEl = pre.querySelector("code")
     const code = (codeEl || pre).textContent?.trim() || ""
-    if (code.length < 5) return
-
-    // Detect language from class
-    const classStr = (codeEl || pre).className || ""
-    const langMatch = classStr.match(/language-(\w+)/)
-    const language = langMatch ? langMatch[1] : "unknown"
-
-    // Detect filename from sibling label
-    const parent = pre.parentElement
-    const labelEl =
-      parent?.querySelector('[class*="filename"], [class*="title"], [class*="label"], [data-testid*="code-title"]') ||
-      pre.previousElementSibling
-
-    let filename: string | undefined
-    const labelText = labelEl?.textContent?.trim()
-    if (labelText && labelText.length < 80 && /\.\w{1,6}$/.test(labelText)) {
-      filename = labelText
-    }
-
-    // Try to detect filename from first-line comment
-    if (!filename) {
-      const firstLine = code.split("\n")[0] || ""
-      const fileMatch = firstLine.match(/(?:\/\/|#|<!--|\/\*)\s*([\w./\-]+\.\w+)/)
-      if (fileMatch) filename = fileMatch[1]
-    }
-
-    blocks.push({ language, code, filename })
+    const cls = (codeEl || pre).className || ""
+    const langMatch = cls.match(/language-(\w+)/)
+    const lang = langMatch ? langMatch[1] : ""
+    const placeholder = document.createTextNode(`\n\`\`\`${lang}\n${code}\n\`\`\`\n`)
+    pre.replaceWith(placeholder)
   })
 
-  return blocks
-}
-
-// ─── Text Cleaning ────────────────────────────────────────────────────────────
-
-function cleanText(raw: string): string {
+  const raw = (clone as HTMLElement).innerText ?? clone.textContent ?? ""
   return raw
-    .replace(/\u00a0/g, " ")       // non-breaking spaces
-    .replace(/\u200b/g, "")        // zero-width spaces
-    .replace(/\t/g, " ")           // tabs to spaces
-    .replace(/[ ]{3,}/g, "  ")     // collapse long space runs
-    .replace(/\n{4,}/g, "\n\n\n")  // max 3 newlines
+    .replace(/\u00a0/g, " ")
+    .replace(/\u200b/g, "")
+    .replace(/[ \t]{3,}/g, "  ")
+    .replace(/\n{4,}/g, "\n\n\n")
     .trim()
 }
 
-// ─── Strategy 1: data-testid Based (Most Reliable) ───────────────────────────
-
-function strategyTestId(): ExtractedMessage[] | null {
-  const userEls = Array.from(document.querySelectorAll(
-    '[data-testid="human-turn"], [data-testid="user-turn"], [data-testid*="human-message"], [data-testid*="user-message"]'
-  ))
-  const assistantEls = Array.from(document.querySelectorAll(
-    '[data-testid="assistant-turn"], [data-testid="ai-turn"], [data-testid*="assistant-message"], [data-testid*="ai-message"]'
-  ))
-
-  if (userEls.length === 0 && assistantEls.length === 0) return null
-
-  return mergeAndBuildMessages(userEls, "user", assistantEls, "assistant")
+function fingerprint(role: string, content: string): string {
+  return role + ":" + content.slice(0, 120).replace(/\s+/g, " ").trim()
 }
 
-// ─── Strategy 2: data-role / aria-label Based ─────────────────────────────────
+// ─── Scroll Container Detection ───────────────────────────────────────────────
 
-function strategyDataRole(): ExtractedMessage[] | null {
-  const roleEls = Array.from(document.querySelectorAll("[data-role]"))
-  if (roleEls.length === 0) return null
+function findScrollContainer(): Element | null {
+  // 1. Claude's known virtualized scroller
+  const explicit = document.querySelector("div.overflow-y-auto.overflow-x-hidden")
+  if (explicit && explicit.scrollHeight > explicit.clientHeight + 50) return explicit
 
-  const tagged: Array<{ el: Element; role: "user" | "assistant" }> = []
-  for (const el of roleEls) {
-    const role = el.getAttribute("data-role")
-    if (role === "human" || role === "user") tagged.push({ el, role: "user" })
-    else if (role === "assistant" || role === "ai" || role === "claude") tagged.push({ el, role: "assistant" })
-  }
-
-  if (tagged.length === 0) return null
-  return buildMessagesFromTagged(tagged)
-}
-
-// ─── Strategy 3: Structural Sibling Analysis ──────────────────────────────────
-/**
- * Claude renders conversation turns as direct children of a scroll container.
- * We find that container, then classify each child as user/assistant.
- */
-function strategyStructural(): ExtractedMessage[] | null {
-  // Look for the scroll container that holds the conversation
-  const scrollCandidates = Array.from(
-    document.querySelectorAll('[class*="conversation"], [class*="thread"], [class*="chat-content"], [class*="messages"], [class*="transcript"]')
-  ).filter(el => !isInSidebarOrNav(el) && !isHiddenElement(el))
-
-  // Also try <main>
-  const main = document.querySelector("main")
-  if (main && !scrollCandidates.includes(main)) scrollCandidates.unshift(main)
-
-  for (const container of scrollCandidates) {
-    const result = extractFromContainer(container)
-    if (result && result.length >= 2) return result
-  }
-
-  return null
-}
-
-function extractFromContainer(container: Element): ExtractedMessage[] | null {
-  // Get direct children that have meaningful content
-  const children = Array.from(container.children).filter(child => {
-    if (isHiddenElement(child)) return false
-    if (isInSidebarOrNav(child)) return false
-    const text = child.textContent?.trim() || ""
-    return text.length > 20
+  // 2. Any scrollable container that's not the sidebar, larger than viewport
+  const candidates = Array.from(
+    document.querySelectorAll("div, main, section, article")
+  ).filter(el => {
+    if (isInSidebar(el)) return false
+    if (isHidden(el)) return false
+    const s = window.getComputedStyle(el)
+    const overflowY = s.overflowY
+    return (
+      (overflowY === "auto" || overflowY === "scroll") &&
+      el.scrollHeight > el.clientHeight + 50
+    )
   })
 
-  if (children.length < 2) return null
-
-  const tagged: Array<{ el: Element; role: "user" | "assistant" }> = []
-
-  for (const child of children) {
-    const role = inferRoleFromElement(child)
-    if (role) tagged.push({ el: child, role })
-  }
-
-  if (tagged.length < 2) return null
-  return buildMessagesFromTagged(tagged)
+  // Return the one with the largest scrollable area
+  return candidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0] ?? null
 }
 
-/**
- * Infer role from an element using multiple heuristics.
- */
-function inferRoleFromElement(el: Element): "user" | "assistant" | null {
+// ─── Message Extraction Strategies ───────────────────────────────────────────
+
+interface TaggedEl { el: Element; role: "user" | "assistant" }
+
+/** Strategy 1: data-testid (most reliable for current Claude UI) */
+function extractByTestId(): TaggedEl[] {
+  const USER_TESTIDS = [
+    '[data-testid="human-turn"]',
+    '[data-testid="user-turn"]',
+    '[data-testid*="human-message"]',
+    '[data-testid*="user-message"]',
+  ]
+  const AI_TESTIDS = [
+    '[data-testid="assistant-turn"]',
+    '[data-testid="ai-turn"]',
+    '[data-testid*="assistant-message"]',
+    '[data-testid*="ai-message"]',
+  ]
+
+  const userEls = Array.from(document.querySelectorAll(USER_TESTIDS.join(",")))
+    .filter(el => !isInSidebar(el) && !isHidden(el))
+  const aiEls = Array.from(document.querySelectorAll(AI_TESTIDS.join(",")))
+    .filter(el => !isInSidebar(el) && !isHidden(el))
+
+  if (userEls.length + aiEls.length === 0) return []
+
+  return [
+    ...userEls.map(el => ({ el, role: "user" as const })),
+    ...aiEls.map(el => ({ el, role: "assistant" as const })),
+  ]
+}
+
+/** Strategy 2: data-role attribute */
+function extractByDataRole(): TaggedEl[] {
+  const all = Array.from(document.querySelectorAll("[data-role]"))
+    .filter(el => !isInSidebar(el) && !isHidden(el))
+
+  const tagged: TaggedEl[] = []
+  for (const el of all) {
+    const r = el.getAttribute("data-role") || ""
+    if (r === "human" || r === "user") tagged.push({ el, role: "user" })
+    else if (r === "assistant" || r === "ai" || r === "claude") tagged.push({ el, role: "assistant" })
+  }
+  return tagged
+}
+
+/** Strategy 3: Walk children of the scroll container, infer role from signals. */
+function extractFromContainer(container: Element): TaggedEl[] {
+  const tagged: TaggedEl[] = []
+
+  // Recursively walk up to 3 levels of children looking for message nodes
+  const walk = (parent: Element, depth: number) => {
+    if (depth > 4) return
+    for (const child of Array.from(parent.children)) {
+      if (isHidden(child) || isInSidebar(child)) continue
+
+      const text = child.textContent?.trim() || ""
+      if (text.length < 15) continue
+
+      const role = inferRole(child)
+      if (role) {
+        tagged.push({ el: child, role })
+        continue  // don't recurse into identified message nodes
+      }
+      walk(child, depth + 1)
+    }
+  }
+
+  walk(container, 0)
+  return tagged
+}
+
+function inferRole(el: Element): "user" | "assistant" | null {
   const cls = (typeof el.className === "string" ? el.className : "").toLowerCase()
   const testId = (el.getAttribute("data-testid") || "").toLowerCase()
   const role = (el.getAttribute("data-role") || "").toLowerCase()
-  const ariaLabel = (el.getAttribute("aria-label") || "").toLowerCase()
+  const aria = (el.getAttribute("aria-label") || "").toLowerCase()
 
-  // Explicit role indicators
   if (role === "human" || role === "user") return "user"
   if (role === "assistant" || role === "ai" || role === "claude") return "assistant"
-
-  // data-testid indicators
   if (/human|user/.test(testId)) return "user"
   if (/assistant|ai-turn|claude/.test(testId)) return "assistant"
+  if (/human message|user message|you said/.test(aria)) return "user"
+  if (/assistant|claude.*response|ai response/.test(aria)) return "assistant"
+  if (/human-turn|user-turn|user-message|human-message/.test(cls)) return "user"
+  if (/assistant|claude-turn|ai-turn|bot-turn|model-turn/.test(cls)) return "assistant"
 
-  // aria-label indicators
-  if (/human message|user message|you said/.test(ariaLabel)) return "user"
-  if (/assistant message|claude(?:'s)? response|ai response/.test(ariaLabel)) return "assistant"
-
-  // Class name heuristics
-  if (/human|user-turn|user-message|human-turn/.test(cls)) return "user"
-  if (/assistant|ai-turn|claude-turn|bot-turn|model-turn/.test(cls)) return "assistant"
-
-  // Visual layout heuristic: user messages often have different alignment
-  // Check for a nested element that suggests user input (textarea origin)
-  if (el.querySelector('[class*="user"], [class*="human"], [data-role="user"], [data-role="human"]')) return "user"
-  if (el.querySelector('[class*="assistant"], [class*="claude"], [data-role="assistant"]')) return "assistant"
+  // Check nested signals
+  if (el.querySelector('[data-testid*="human"], [data-testid*="user"], [data-role="user"], [data-role="human"]')) return "user"
+  if (el.querySelector('[data-testid*="assistant"], [data-role="assistant"]')) return "assistant"
 
   return null
 }
 
-// ─── Strategy 4: Content-Density Alternating Heuristic ───────────────────────
-/**
- * Last resort: find large prose blocks, deduplicate, and alternate roles.
- * First message is assumed to be user.
- */
-function strategyAlternating(): ExtractedMessage[] | null {
-  const main =
-    document.querySelector("main") ||
-    document.querySelector('[role="main"]') ||
-    document.body
+// ─── Deduplication & Sorting ─────────────────────────────────────────────────
 
-  // Find substantial text blocks not in sidebar/nav
-  const candidates = Array.from(main.querySelectorAll("div, article, section"))
-    .filter(el => {
-      if (isHiddenElement(el)) return false
-      if (isInSidebarOrNav(el)) return false
-      const text = el.textContent?.trim() || ""
-      // Must have substantial content
-      if (text.length < 80) return false
-      // Must not have too many children (avoid wrapper divs)
-      if (el.children.length > 15) return false
-      return true
-    })
-
-  if (candidates.length < 2) return null
-
-  // Compute depth for each candidate
-  const withDepth = candidates.map(el => ({
-    el,
-    depth: getDepth(el),
-    textLength: (el.textContent || "").trim().length
-  }))
-
-  // Find modal depth (most common = likely message level)
-  const depths = withDepth.map(w => w.depth)
-  const modalDepth = mode(depths)
-
-  // Keep only elements at the modal depth ± 1
-  const atDepth = withDepth.filter(w => Math.abs(w.depth - modalDepth) <= 1)
-
-  if (atDepth.length < 2) return null
-
-  // Deduplicate: remove elements that are children of others in the list
-  const deduped: typeof atDepth = []
-  for (const item of atDepth) {
-    const isChildOfAnother = deduped.some(
-      other => other.el.contains(item.el) || item.el.contains(other.el)
-    )
-    if (!isChildOfAnother) deduped.push(item)
-  }
-
-  if (deduped.length < 2) return null
-
-  // Sort by DOM order
-  deduped.sort((a, b) => {
+function sortByDOMOrder(items: TaggedEl[]): TaggedEl[] {
+  return [...items].sort((a, b) => {
     const pos = a.el.compareDocumentPosition(b.el)
-    return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1
+    return 0
   })
-
-  // Alternate roles starting with user
-  const messages: ExtractedMessage[] = []
-  deduped.forEach((item, i) => {
-    const prose = extractProseText(item.el)
-    const codeBlocks = extractCodeBlocks(item.el)
-
-    if (isLikelyNoise(prose) && codeBlocks.length === 0) return
-    if (prose.length < 20 && codeBlocks.length === 0) return
-
-    messages.push({
-      id: `msg-${i}`,
-      role: i % 2 === 0 ? "user" : "assistant",
-      content: prose,
-      codeBlocks,
-      rawLength: item.el.textContent?.length || 0,
-      index: i
-    })
-  })
-
-  return messages.length >= 2 ? messages : null
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function mergeAndBuildMessages(
-  userEls: Element[], userRole: "user",
-  assistantEls: Element[], assistantRole: "assistant"
-): ExtractedMessage[] {
-  const tagged: Array<{ el: Element; role: "user" | "assistant" }> = [
-    ...userEls.map(el => ({ el, role: userRole })),
-    ...assistantEls.map(el => ({ el, role: assistantRole }))
-  ]
-  return buildMessagesFromTagged(tagged)
-}
-
-function buildMessagesFromTagged(
-  tagged: Array<{ el: Element; role: "user" | "assistant" }>
-): ExtractedMessage[] {
-  // Sort by DOM position
-  tagged.sort((a, b) => {
-    const pos = a.el.compareDocumentPosition(b.el)
-    return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
-  })
-
-  // Deduplicate (remove parent/child overlaps, keep deepest)
-  const deduped: typeof tagged = []
-  for (const item of tagged) {
+function deduplicateTagged(items: TaggedEl[]): TaggedEl[] {
+  const deduped: TaggedEl[] = []
+  for (const item of items) {
+    // Skip if this element is a child/parent of an already-kept element
     const overlaps = deduped.some(
       prev => prev.el.contains(item.el) || item.el.contains(prev.el)
     )
     if (!overlaps) deduped.push(item)
   }
-
-  const messages: ExtractedMessage[] = []
-  deduped.forEach((item, i) => {
-    const prose = extractProseText(item.el)
-    const codeBlocks = extractCodeBlocks(item.el)
-
-    // Skip if content is pure noise and no code
-    if (isLikelyNoise(prose) && codeBlocks.length === 0) return
-    if (prose.length < 10 && codeBlocks.length === 0) return
-
-    messages.push({
-      id: `msg-${i}`,
-      role: item.role,
-      content: prose,
-      codeBlocks,
-      rawLength: item.el.textContent?.length || 0,
-      index: i
-    })
-  })
-
-  return messages
-}
-
-// ─── Extraction Quality Validator ─────────────────────────────────────────────
-
-function validateExtraction(
-  messages: ExtractedMessage[],
-  strategy: string
-): ExtractionQuality {
-  const issues: string[] = []
-  let score = 100
-
-  if (messages.length === 0) {
-    return { score: 0, isReliable: false, issues: ["No messages extracted"] }
-  }
-
-  // Check for UI noise contamination
-  const allText = messages.map(m => m.content).join("\n").toLowerCase()
-
-  const noiseIndicators = [
-    { phrase: "free plan", label: "Pricing UI text detected" },
-    { phrase: "upgrade to pro", label: "Upgrade prompt detected" },
-    { phrase: "new chat", label: "Navigation UI detected" },
-    { phrase: "keyboard shortcuts", label: "Settings UI detected" },
-    { phrase: "sign out", label: "Account menu detected" },
-    { phrase: "search conversations", label: "Sidebar content detected" },
-  ]
-
-  for (const { phrase, label } of noiseIndicators) {
-    if (allText.includes(phrase)) {
-      issues.push(label)
-      score -= 25
-    }
-  }
-
-  // Check for suspiciously short messages on average
-  const avgLength = messages.reduce((a, m) => a + m.content.length, 0) / messages.length
-  if (avgLength < 30) {
-    issues.push("Average message length is very short — possible UI fragment extraction")
-    score -= 30
-  }
-
-  // Check for minimum message count
-  if (messages.length === 1) {
-    issues.push("Only 1 message extracted — conversation may not be on screen")
-    score -= 20
-  }
-
-  // Check role alternation (should roughly alternate user/assistant)
-  const roles = messages.map(m => m.role)
-  let sameRoleRuns = 0
-  for (let i = 1; i < roles.length; i++) {
-    if (roles[i] === roles[i - 1]) sameRoleRuns++
-  }
-  if (sameRoleRuns > messages.length * 0.4) {
-    issues.push("Role detection may be unreliable — many consecutive same-role messages")
-    score -= 15
-  }
-
-  // Penalize alternating strategy (least reliable)
-  if (strategy === "alternating") {
-    issues.push("Used fallback extraction strategy — roles may be inaccurate")
-    score -= 10
-  }
-
-  score = Math.max(0, score)
-  return {
-    score,
-    isReliable: score >= 50 && issues.filter(i => i.includes("Pricing") || i.includes("Navigation") || i.includes("Sidebar")).length === 0,
-    issues
-  }
+  return deduped
 }
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -587,191 +284,212 @@ export async function extractClaudeConversation(
   onProgress?: (p: ExtractionProgress) => void
 ): Promise<ExtractionResult> {
   const t0 = performance.now()
+  const seen = new Set<string>()
+  const allMessages: RawMessage[] = []
+  const warnings: string[] = []
 
-  // 1. Locate the scroll container
-  // TEMPORARY FIX: Prioritize Claude's actual virtualized scroll container
-  let scrollContainer = document.querySelector('div.overflow-y-auto.overflow-x-hidden')
-
-  if (!scrollContainer) {
-    const scrollCandidates = Array.from(
-      document.querySelectorAll('[class*="conversation"], [class*="thread"], [class*="chat-content"], [class*="messages"], [class*="transcript"]')
-    ).filter(el => !isInSidebarOrNav(el) && !isHiddenElement(el))
-    
-    // Choose the one with the largest scrollHeight
-    scrollContainer = scrollCandidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
+  const emit = (stage: string) => {
+    if (!onProgress) return
+    onProgress({
+      stage,
+      totalFound: allMessages.length,
+      userCount: allMessages.filter(m => m.role === "user").length,
+      assistantCount: allMessages.filter(m => m.role === "assistant").length,
+      codeBlockCount: allMessages.filter(m => m.content.includes("```")).length,
+      durationMs: Math.round(performance.now() - t0),
+    })
   }
 
-  if (!scrollContainer && document.documentElement.scrollHeight > document.documentElement.clientHeight) {
-    scrollContainer = document.documentElement
-  }
-
-  console.log("[JumpAI] Starting extraction session", {
-    containerFound: !!scrollContainer,
-    containerClass: scrollContainer?.className
-  })
-
-  const strategies: Array<{ name: string; fn: () => ExtractedMessage[] | null }> = [
-    { name: "testid", fn: strategyTestId },
-    { name: "data-role", fn: strategyDataRole },
-    { name: "structural", fn: strategyStructural },
-    { name: "alternating", fn: strategyAlternating },
-  ]
-
-  let activeStrategy = strategies[0]
-  let firstBatch: ExtractedMessage[] | null = null
-  let strategyUsed = "none"
-
-  for (const s of strategies) {
-    firstBatch = s.fn()
-    if (firstBatch && firstBatch.length > 0) {
-      activeStrategy = s
-      strategyUsed = s.name
-      break
-    }
-  }
-
-  if (!firstBatch || firstBatch.length === 0) {
-    return {
-      messages: [],
-      strategy: "none",
-      quality: { score: 0, isReliable: false, issues: ["All extraction strategies failed"] },
-      warnings: ["Could not extract conversation. Make sure you are on a Claude conversation page with messages visible."]
-    }
-  }
-
-  const extractedMap = new Map<string, ExtractedMessage>()
-  const allMessages: ExtractedMessage[] = []
-
-  const mergeBatch = (batch: ExtractedMessage[]) => {
+  const addBatch = (tagged: TaggedEl[]): number => {
     let added = 0
-    // Prepend in reverse to maintain chronological order
-    for (let i = batch.length - 1; i >= 0; i--) {
-      const msg = batch[i]
-      const hash = msg.role + ":" + msg.content.slice(0, 100) + ":" + msg.codeBlocks.length
-      if (!extractedMap.has(hash)) {
-        extractedMap.set(hash, msg)
-        allMessages.unshift(msg)
+    const sorted = sortByDOMOrder(deduplicateTagged(tagged))
+    // Prepend newly discovered older messages
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      const { el, role } = sorted[i]
+      const content = extractContent(el)
+      if (!content || content.length < 5) continue
+      if (isNoise(content)) continue
+      const key = fingerprint(role, content)
+      if (!seen.has(key)) {
+        seen.add(key)
+        allMessages.unshift({ role, content })
         added++
       }
     }
     return added
   }
 
-  mergeBatch(firstBatch)
+  // ── Step 1: Detect scroll container ──────────────────────────────────────
+  emit("Detecting container")
+  const scrollContainer = findScrollContainer()
 
-  // 2. Progressively scroll upward
-  if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
-    let noNewMessagesCount = 0
-    let scrollAttempts = 0
+  console.log("[JumpAI] Container detected:", {
+    found: !!scrollContainer,
+    class: scrollContainer?.className?.slice?.(0, 80),
+    scrollHeight: scrollContainer?.scrollHeight,
+  })
 
-    console.log("[JumpAI] Starting progressive scroll extraction")
+  // ── Step 2: Pick strategy & first extraction ──────────────────────────────
+  emit("Loading conversation")
 
-    while (noNewMessagesCount < 3 && scrollAttempts < 40) {
-      scrollAttempts++
-      const lastScroll = scrollContainer.scrollTop
+  let strategyUsed = "none"
 
-      // Incremental scrolling (avoid jumping to top instantly)
+  // Try testid first (most reliable)
+  let firstBatch = extractByTestId()
+  if (firstBatch.length >= 1) {
+    strategyUsed = "testid"
+  } else {
+    firstBatch = extractByDataRole()
+    if (firstBatch.length >= 1) {
+      strategyUsed = "data-role"
+    } else if (scrollContainer) {
+      firstBatch = extractFromContainer(scrollContainer)
+      if (firstBatch.length >= 1) strategyUsed = "container-walk"
+    }
+  }
+
+  console.log("[JumpAI] Strategy selected:", strategyUsed, "| initial batch:", firstBatch.length)
+
+  if (firstBatch.length === 0) {
+    warnings.push("Could not find any message elements. Are you on a Claude conversation page?")
+    return {
+      messages: [],
+      strategy: "none",
+      warnings,
+      debugDump: "MESSAGES FOUND: 0\n\nNo messages could be extracted. Please open a Claude conversation.",
+    }
+  }
+
+  addBatch(firstBatch)
+  emit("Extracting messages")
+
+  // ── Step 3: Progressive scroll upward ────────────────────────────────────
+  if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight + 50) {
+    let noNewCount = 0
+    let attempts = 0
+
+    console.log("[JumpAI] Starting scroll recovery. scrollHeight:", scrollContainer.scrollHeight)
+
+    while (noNewCount < 3 && attempts < 40) {
+      attempts++
+      const prevTop = scrollContainer.scrollTop
+
+      // Incremental scroll — 1200px steps
       scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 1200)
-      
-      // Wait for React virtualization to render new nodes
+
+      // Wait for React to mount newly virtualised nodes
       await new Promise(r => setTimeout(r, 500))
 
-      const batch = activeStrategy.fn() || []
-      const added = mergeBatch(batch)
+      // Re-run the winning strategy
+      let batch: TaggedEl[] = []
+      if (strategyUsed === "testid") batch = extractByTestId()
+      else if (strategyUsed === "data-role") batch = extractByDataRole()
+      else batch = extractFromContainer(scrollContainer)
 
-      console.log("[JumpAI] Scroll iteration", {
-        scrollAttempts,
+      const added = addBatch(batch)
+
+      console.log("[JumpAI] Scroll attempt", attempts, {
         scrollTop: scrollContainer.scrollTop,
-        batchSize: batch.length,
-        newMessagesFound: added,
-        totalExtracted: allMessages.length,
-        extractionStage: "Scrolling and Deduplicating"
+        newMessages: added,
+        total: allMessages.length,
       })
 
-      if (onProgress) {
-        onProgress({
-          totalFound: allMessages.length,
-          userCount: allMessages.filter(m => m.role === "user").length,
-          assistantCount: allMessages.filter(m => m.role === "assistant").length,
-          codeBlockCount: allMessages.reduce((sum, m) => sum + m.codeBlocks.length, 0),
-          durationMs: Math.round(performance.now() - t0)
-        })
-      }
+      emit(`Recovering history (${allMessages.length} found)`)
 
-      if (added === 0) {
-        noNewMessagesCount++
-      } else {
-        noNewMessagesCount = 0
-      }
+      if (added === 0) noNewCount++
+      else noNewCount = 0
 
       if (scrollContainer.scrollTop <= 0) {
-        console.log("[JumpAI] Reached top of conversation")
+        console.log("[JumpAI] Reached top of conversation.")
         break
       }
 
-      // If scroll didn't change (forced bottom or stuck)
-      if (scrollContainer.scrollTop === lastScroll && lastScroll !== 0) {
-        noNewMessagesCount++
-      }
+      // Stuck check
+      if (scrollContainer.scrollTop === prevTop) noNewCount++
     }
 
-    console.log("[JumpAI] Extraction complete. Restoring scroll position.")
-    // Scroll back to bottom to restore user view
+    // Restore scroll position
     scrollContainer.scrollTop = scrollContainer.scrollHeight
+    console.log("[JumpAI] Scroll complete. Total messages:", allMessages.length)
   }
 
-  // Re-index chronologically
-  allMessages.forEach((m, i) => m.index = i)
-
-  const quality = validateExtraction(allMessages, strategyUsed)
-  
-  // Heavily penalize if we still only got a few messages
-  if (allMessages.length <= 2) {
-    quality.score = Math.min(quality.score, 30)
-    quality.isReliable = false
-    quality.issues.push("Incomplete extraction detected — only 1-2 messages found. Conversation may not be fully loaded.")
-  } else if (allMessages.length < 5) {
-    quality.score = Math.min(quality.score, 50)
-    quality.issues.push("Low message count — continuity context may be weak.")
+  // ── Step 4: Sanity warnings ───────────────────────────────────────────────
+  if (allMessages.length === 0) {
+    warnings.push("Extraction returned 0 messages — selector may not match current Claude DOM")
+  } else if (allMessages.length <= 2) {
+    warnings.push("Only 1–2 messages found. Conversation may be incomplete.")
   }
+
+  const userCount = allMessages.filter(m => m.role === "user").length
+  const aiCount = allMessages.filter(m => m.role === "assistant").length
+  if (allMessages.length > 2 && Math.abs(userCount - aiCount) > 3) {
+    warnings.push(`Role imbalance: ${userCount} user vs ${aiCount} assistant — some roles may be wrong`)
+  }
+
+  // ── Step 5: Build debug dump ──────────────────────────────────────────────
+  const durationSec = ((performance.now() - t0) / 1000).toFixed(1)
+  const dumpLines: string[] = [
+    `MESSAGES FOUND: ${allMessages.length}`,
+    `User: ${userCount}  |  Assistant: ${aiCount}`,
+    `Strategy: ${strategyUsed}  |  Time: ${durationSec}s`,
+    "",
+  ]
+  for (const msg of allMessages) {
+    dumpLines.push(`[${msg.role.toUpperCase()}]`)
+    dumpLines.push(msg.content.slice(0, 400) + (msg.content.length > 400 ? "…" : ""))
+    dumpLines.push("")
+  }
+
+  emit("Done")
 
   return {
     messages: allMessages,
     strategy: strategyUsed,
-    quality,
-    warnings: quality.issues
+    warnings,
+    debugDump: dumpLines.join("\n"),
   }
 }
 
-// ─── Legacy Compatibility ─────────────────────────────────────────────────────
-// Keep old shape for any code that still imports ConversationMessage
+// ─── Legacy shim — still consumed by packet-builder ──────────────────────────
 
-export async function extractClaudeConversationLegacy() {
-  const result = await extractClaudeConversation()
-  return result.messages.map(m => ({
-    role: m.role,
-    content: m.content + (m.codeBlocks.length > 0
-      ? "\n\n" + m.codeBlocks.map(cb => "```" + cb.language + "\n" + cb.code + "\n```").join("\n\n")
-      : ""),
-    index: m.index
-  }))
+export type ExtractedMessage = {
+  id: string
+  role: "user" | "assistant"
+  content: string
+  codeBlocks: { language: string; code: string; filename?: string }[]
+  rawLength: number
+  index: number
 }
 
-// ─── DOM Helpers ──────────────────────────────────────────────────────────────
-
-function getDepth(el: Element): number {
-  let depth = 0
-  let current = el.parentElement
-  while (current && current !== document.documentElement) {
-    depth++
-    current = current.parentElement
-  }
-  return depth
+export type ExtractionQuality = {
+  score: number
+  isReliable: boolean
+  issues: string[]
 }
 
-function mode(arr: number[]): number {
-  const freq: Record<number, number> = {}
-  arr.forEach(n => (freq[n] = (freq[n] || 0) + 1))
-  const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1])
-  return parseInt(sorted[0]?.[0] ?? "0")
+export function isLikelyNoise(text: string): boolean {
+  return isNoise(text)
+}
+
+/** Converts the new flat RawMessage[] into the ExtractedMessage[] shape. */
+export function toExtractedMessages(raw: RawMessage[]): ExtractedMessage[] {
+  return raw.map((m, i) => {
+    // Pull code blocks back out so packet-builder can see them
+    const codeBlocks: ExtractedMessage["codeBlocks"] = []
+    const codeRe = /```(\w*)\n([\s\S]*?)```/g
+    let match: RegExpExecArray | null
+    while ((match = codeRe.exec(m.content)) !== null) {
+      codeBlocks.push({ language: match[1] || "unknown", code: match[2].trim() })
+    }
+    // Strip code fences from prose
+    const prose = m.content.replace(/```[\s\S]*?```/g, "").trim()
+    return {
+      id: `msg-${i}`,
+      role: m.role,
+      content: prose,
+      codeBlocks,
+      rawLength: m.content.length,
+      index: i,
+    }
+  })
 }

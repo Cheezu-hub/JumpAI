@@ -113,7 +113,7 @@ export const PLATFORMS: Platform[] = [
 export type MessageType =
   | { type: "EXTRACT_CONVERSATION" }
   | { type: "CONVERSATION_DATA"; messages: ConversationMessage[] }
-  | { type: "OPEN_TAB"; url: string }
+  | { type: "OPEN_TAB"; url: string; packetText?: string }
   | { type: "ERROR"; message: string }
 
 // ─── UI State ─────────────────────────────────────────────────────────────────
