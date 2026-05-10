@@ -1,0 +1,46 @@
+{
+  "name": "jumpai",
+  "displayName": "JumpAI",
+  "version": "1.0.0",
+  "description": "Continue AI conversations across platforms without losing context.",
+  "private": true,
+  "scripts": {
+    "dev": "plasmo dev",
+    "build": "plasmo build",
+    "package": "plasmo package"
+  },
+  "dependencies": {
+    "plasmo": "^0.90.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "lucide-react": "0.363.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.0.258",
+    "@types/node": "20.11.5",
+    "@types/react": "18.2.48",
+    "@types/react-dom": "18.2.18",
+    "autoprefixer": "10.4.17",
+    "postcss": "8.4.33",
+    "tailwindcss": "3.4.1",
+    "typescript": "5.3.3"
+  },
+  "manifest": {
+    "host_permissions": [
+      "https://claude.ai/*"
+    ],
+    "permissions": [
+      "tabs",
+      "clipboardWrite",
+      "activeTab",
+      "scripting"
+    ],
+    "action": {
+      "default_title": "JumpAI"
+    }
+  },
+  "overrides": {
+    "sharp": "^0.34.5",
+    "@parcel/watcher": "^2.5.6"
+  }
+}
