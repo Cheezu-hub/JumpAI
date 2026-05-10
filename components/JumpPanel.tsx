@@ -3,7 +3,9 @@ import { extractClaudeConversation } from "../lib/extractor"
 import type { ExtractedMessage, ExtractionResult, ExtractionProgress } from "../lib/extractor"
 import { buildContinuationPacket, formatPacketForPlatform } from "../lib/packet-builder"
 import { PLATFORMS } from "../lib/types"
-import type { PanelState, TargetPlatform, CompressionMode, ContinuationPacket } from "../lib/types"
+import type { TargetPlatform, CompressionMode, ContinuationPacket } from "../lib/types"
+
+type PanelState = "idle" | "extracting" | "copied" | "error" | "warning"
 import { JumpAILogo } from "./Icons"
 import { PlatformButton } from "./PlatformButton"
 
@@ -179,61 +181,71 @@ export function JumpPanel() {
   const isError = panelState === "error"
   const hasResult = extractionResult !== null
 
-  const handleExtractAndJump = useCallback(async (platform?: typeof PLATFORMS[0]) => {
+  const handleExtractAndJump = useCallback(async (platform?: typeof PLATFORMS[0], forceContinue = false) => {
     if (platform) {
       setActiveTarget(platform.id)
       setLastPlatformId(platform.id)
     }
-    setPanelState("extracting")
-    setStatusMsg("Scrolling to extract history…")
-    setProgress(null)
 
-    try {
-      const result = await extractClaudeConversation((p) => {
-        setProgress(p)
-        setStatusMsg(`Extracting… ${p.totalFound} messages found`)
-      })
-      
-      setExtractionResult(result)
+    if (!forceContinue) {
+      setPanelState("extracting")
+      setStatusMsg("Scrolling to extract history…")
+      setProgress(null)
 
-      if (!result.quality.isReliable) {
+      try {
+        const result = await extractClaudeConversation((p) => {
+          setProgress(p)
+          setStatusMsg(`Extracting… ${p.totalFound} messages found`)
+        })
+        
+        setExtractionResult(result)
+
+        setStatusMsg("Classifying & compressing…")
+        await new Promise(r => setTimeout(r, 60))
+
+        const { packet: built, debugStats: stats } = buildContinuationPacket(result.messages, mode)
+        setPacket(built)
+        setDebugStats(stats)
+
+        if (!result.quality.isReliable) {
+          setPanelState("warning")
+          setStatusMsg("Low confidence extraction detected. Continuation may be incomplete.")
+          return // Stop here, wait for user to click "Continue Anyway"
+        }
+
+        // If reliable, fall through to jumping
+      } catch (err) {
+        console.error("[JumpAI]", err)
         setPanelState("error")
-        setStatusMsg("Low confidence extraction — check Diagnostics")
+        setStatusMsg("Extraction failed — check Diagnostics")
         setTab("diagnostics")
-        setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 4000)
+        setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 3000)
         return
       }
-
-      setStatusMsg("Classifying & compressing…")
-      await new Promise(r => setTimeout(r, 60))
-
-      const { packet: built, debugStats: stats } = buildContinuationPacket(result.messages, mode)
-      setPacket(built)
-      setDebugStats(stats)
-
-      if (platform) {
-        const text = formatPacketForPlatform(built, platform.id)
-        await navigator.clipboard.writeText(text)
-        setPanelState("copied")
-        setStatusMsg(`✓ Ready to continue (~${built.tokenEstimate} tokens)`)
-
-        await new Promise(r => setTimeout(r, 700))
-        chrome.runtime.sendMessage({ type: "OPEN_TAB", url: platform.url })
-
-        setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 2500)
-      } else {
-        setPanelState("idle")
-        setStatusMsg("")
-        setTab("preview")
-      }
-    } catch (err) {
-      console.error("[JumpAI]", err)
-      setPanelState("error")
-      setStatusMsg("Extraction failed — check Diagnostics")
-      setTab("diagnostics")
-      setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 3000)
     }
-  }, [mode])
+
+    // -- Jumping logic (reached if reliable OR if forceContinue is true) --
+    if (platform && packet) {
+      const text = formatPacketForPlatform(packet, platform.id)
+      await navigator.clipboard.writeText(text)
+      setPanelState("copied")
+      setStatusMsg(`✓ Ready to continue (~${packet.tokenEstimate} tokens)`)
+
+      await new Promise(r => setTimeout(r, 700))
+      chrome.runtime.sendMessage({ type: "OPEN_TAB", url: platform.url })
+
+      setTimeout(() => { setPanelState("idle"); setActiveTarget(null) }, 2500)
+    } else if (!platform && !forceContinue) {
+      setPanelState("idle")
+      setStatusMsg("")
+      setTab("preview")
+    } else if (forceContinue && !platform) {
+      // forced preview
+      setPanelState("idle")
+      setStatusMsg("")
+      setTab("preview")
+    }
+  }, [mode, packet])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && isOpen) setIsOpen(false) }
@@ -241,7 +253,9 @@ export function JumpPanel() {
     return () => window.removeEventListener("keydown", onKey)
   }, [isOpen])
 
-  const dotColor = isCopied ? "#4ade80" : isError ? "#f87171" : isLoading ? "#fbbf24" : "#cc785c"
+  const isWarning = panelState === "warning"
+
+  const dotColor = isCopied ? "#4ade80" : (isError || isWarning) ? "#f87171" : isLoading ? "#fbbf24" : "#cc785c"
 
   return (
     <>
@@ -287,15 +301,28 @@ export function JumpPanel() {
           </div>
 
           {/* Status bar */}
-          {(isLoading || isCopied || isError) && (
-            <div style={{ padding: "7px 14px", display: "flex", alignItems: "center", gap: 8, background: isCopied ? "rgba(74,222,128,0.07)" : isError ? "rgba(248,113,113,0.07)" : "rgba(251,191,36,0.05)", borderBottom: "1px solid rgba(255,255,255,0.05)", animation: "ji-in 0.2s ease" }}>
+          {(isLoading || isCopied || isError || isWarning) && (
+            <div style={{ padding: "7px 14px", display: "flex", alignItems: "center", gap: 8, background: isCopied ? "rgba(74,222,128,0.07)" : (isError || isWarning) ? "rgba(248,113,113,0.07)" : "rgba(251,191,36,0.05)", borderBottom: "1px solid rgba(255,255,255,0.05)", animation: "ji-in 0.2s ease" }}>
               {isLoading && <div style={{ width: 12, height: 12, border: "2px solid rgba(251,191,36,0.2)", borderTopColor: "#fbbf24", borderRadius: "50%", animation: "ji-spin 0.7s linear infinite", flexShrink: 0 }} />}
               {isCopied && <span style={{ color: "#4ade80", fontSize: 13, fontWeight: "bold" }}>✓</span>}
-              {isError && <span style={{ color: "#f87171", fontSize: 13, fontWeight: "bold" }}>⚠</span>}
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 10.5, fontWeight: 500, color: isCopied ? "#4ade80" : isError ? "#f87171" : "rgba(251,191,36,0.9)" }}>{statusMsg}</div>
-                {isLoading && progress && (
-                  <div style={{ fontSize: 9, color: "rgba(251,191,36,0.6)", marginTop: 2 }}>User: {progress.userCount} · AI: {progress.assistantCount}</div>
+              {(isError || isWarning) && <span style={{ color: "#f87171", fontSize: 13, fontWeight: "bold" }}>⚠</span>}
+              <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>
+                  <div style={{ fontSize: 10.5, fontWeight: 500, color: isCopied ? "#4ade80" : (isError || isWarning) ? "#f87171" : "rgba(251,191,36,0.9)" }}>{statusMsg}</div>
+                  {isLoading && progress && (
+                    <div style={{ fontSize: 9, color: "rgba(251,191,36,0.6)", marginTop: 2 }}>User: {progress.userCount} · AI: {progress.assistantCount}</div>
+                  )}
+                </div>
+                {isWarning && (
+                  <button 
+                    onClick={() => handleExtractAndJump(activeTarget ? PLATFORMS.find(p => p.id === activeTarget) : undefined, true)}
+                    style={{
+                      padding: "4px 8px", background: "rgba(248,113,113,0.15)", border: "1px solid rgba(248,113,113,0.3)",
+                      borderRadius: 4, color: "#f87171", fontSize: 9.5, fontWeight: 600, cursor: "pointer"
+                    }}
+                  >
+                    Continue Anyway
+                  </button>
                 )}
               </div>
             </div>

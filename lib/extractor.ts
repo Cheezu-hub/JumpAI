@@ -589,15 +589,26 @@ export async function extractClaudeConversation(
   const t0 = performance.now()
 
   // 1. Locate the scroll container
-  const scrollCandidates = Array.from(
-    document.querySelectorAll('[class*="conversation"], [class*="thread"], [class*="chat-content"], [class*="messages"], [class*="transcript"]')
-  ).filter(el => !isInSidebarOrNav(el) && !isHiddenElement(el))
-  
-  // Choose the one with the largest scrollHeight
-  let scrollContainer = scrollCandidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
+  // TEMPORARY FIX: Prioritize Claude's actual virtualized scroll container
+  let scrollContainer = document.querySelector('div.overflow-y-auto.overflow-x-hidden')
+
+  if (!scrollContainer) {
+    const scrollCandidates = Array.from(
+      document.querySelectorAll('[class*="conversation"], [class*="thread"], [class*="chat-content"], [class*="messages"], [class*="transcript"]')
+    ).filter(el => !isInSidebarOrNav(el) && !isHiddenElement(el))
+    
+    // Choose the one with the largest scrollHeight
+    scrollContainer = scrollCandidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
+  }
+
   if (!scrollContainer && document.documentElement.scrollHeight > document.documentElement.clientHeight) {
     scrollContainer = document.documentElement
   }
+
+  console.log("[JumpAI] Starting extraction session", {
+    containerFound: !!scrollContainer,
+    containerClass: scrollContainer?.className
+  })
 
   const strategies: Array<{ name: string; fn: () => ExtractedMessage[] | null }> = [
     { name: "testid", fn: strategyTestId },
@@ -653,18 +664,29 @@ export async function extractClaudeConversation(
     let noNewMessagesCount = 0
     let scrollAttempts = 0
 
-    while (noNewMessagesCount < 3 && scrollAttempts < 30) {
+    console.log("[JumpAI] Starting progressive scroll extraction")
+
+    while (noNewMessagesCount < 3 && scrollAttempts < 40) {
       scrollAttempts++
       const lastScroll = scrollContainer.scrollTop
 
-      // Scroll up by ~80% of viewport
-      scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - scrollContainer.clientHeight * 0.8)
+      // Incremental scrolling (avoid jumping to top instantly)
+      scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - 1200)
       
       // Wait for React virtualization to render new nodes
-      await new Promise(r => setTimeout(r, 400))
+      await new Promise(r => setTimeout(r, 500))
 
       const batch = activeStrategy.fn() || []
       const added = mergeBatch(batch)
+
+      console.log("[JumpAI] Scroll iteration", {
+        scrollAttempts,
+        scrollTop: scrollContainer.scrollTop,
+        batchSize: batch.length,
+        newMessagesFound: added,
+        totalExtracted: allMessages.length,
+        extractionStage: "Scrolling and Deduplicating"
+      })
 
       if (onProgress) {
         onProgress({
@@ -682,7 +704,10 @@ export async function extractClaudeConversation(
         noNewMessagesCount = 0
       }
 
-      if (scrollContainer.scrollTop === 0) break
+      if (scrollContainer.scrollTop <= 0) {
+        console.log("[JumpAI] Reached top of conversation")
+        break
+      }
 
       // If scroll didn't change (forced bottom or stuck)
       if (scrollContainer.scrollTop === lastScroll && lastScroll !== 0) {
@@ -690,6 +715,7 @@ export async function extractClaudeConversation(
       }
     }
 
+    console.log("[JumpAI] Extraction complete. Restoring scroll position.")
     // Scroll back to bottom to restore user view
     scrollContainer.scrollTop = scrollContainer.scrollHeight
   }
