@@ -1,0 +1,21 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="128" height="128" rx="28" fill="#0b0b0d"/>
+  
+  <!-- Border -->
+  <rect x="0.5" y="0.5" width="127" height="127" rx="27.5" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
+
+  <!-- Accent circle glow -->
+  <circle cx="64" cy="64" r="36" fill="rgba(204, 120, 92, 0.08)"/>
+  
+  <!-- Jump arc path -->
+  <path d="M32 72 Q32 44 60 44 L80 44" stroke="#cc785c" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.9"/>
+  
+  <!-- Arrow head -->
+  <path d="M72 36 L80 44 L72 52" stroke="#cc785c" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  
+  <!-- Dots (trail) -->
+  <circle cx="32" cy="72" r="6" fill="#cc785c" opacity="0.9"/>
+  <circle cx="60" cy="86" r="4.5" fill="#cc785c" opacity="0.5"/>
+  <circle cx="90" cy="80" r="3" fill="#cc785c" opacity="0.3"/>
+</svg>
