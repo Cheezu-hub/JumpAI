@@ -113,7 +113,12 @@ export const PLATFORMS: Platform[] = [
 export type MessageType =
   | { type: "EXTRACT_CONVERSATION" }
   | { type: "CONVERSATION_DATA"; messages: ConversationMessage[] }
-  | { type: "OPEN_TAB"; url: string; packetText?: string }
+  /**
+   * Sent by the Claude source content script (claude.tsx) when the user
+   * clicks a platform button. `platform` is the TargetPlatform id used as
+   * the session storage key by the background worker.
+   */
+  | { type: "OPEN_TAB"; url: string; platform: TargetPlatform; packetText?: string }
   | { type: "ERROR"; message: string }
 
 // ─── UI State ─────────────────────────────────────────────────────────────────
