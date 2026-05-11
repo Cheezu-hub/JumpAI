@@ -230,9 +230,10 @@ export function JumpPanel() {
         setStatusMsg(`✓ Ready to continue (~${packet.tokenEstimate} tokens)`)
 
         await new Promise(r => setTimeout(r, 700))
-        chrome.runtime.sendMessage({ 
-          type: "OPEN_TAB", 
+        chrome.runtime.sendMessage({
+          type: "OPEN_TAB",
           url: platform.url,
+          platform: platform.id,
           packetText: text
         })
 
