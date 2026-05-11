@@ -27,13 +27,16 @@
   },
   "manifest": {
     "host_permissions": [
-      "https://claude.ai/*"
+      "https://claude.ai/*",
+      "https://chatgpt.com/*",
+      "https://gemini.google.com/*"
     ],
     "permissions": [
       "tabs",
       "clipboardWrite",
       "activeTab",
-      "scripting"
+      "scripting",
+      "storage"
     ],
     "action": {
       "default_title": "JumpAI"
