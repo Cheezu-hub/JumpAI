@@ -1,7 +1,16 @@
 /**
- * JumpAI Content Script
- * Injected on all claude.ai pages.
- * Renders the floating JumpAI panel via Plasmo's CSUI system.
+ * JumpAI — Claude Source Content Script
+ *
+ * Responsibilities (source platform only):
+ *  - Inject the floating JumpAI panel UI into all claude.ai pages
+ *  - Drive conversation extraction (via lib/extractor.ts)
+ *  - Build the continuation packet (via lib/packet-builder.ts)
+ *  - Send an OPEN_TAB message to the background worker, which stores
+ *    the packet in chrome.storage.session and opens the destination tab
+ *
+ * This script does NOT inject anything into destination platforms.
+ * ChatGPT injection → contents/chatgpt.ts
+ * Gemini injection  → contents/gemini.ts
  */
 
 import cssText from "data-text:~/style.css"
